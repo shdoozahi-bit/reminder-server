@@ -301,62 +301,163 @@ cron.schedule('* * * * *', async () => {
 // ════════════════════════════════════════
 // DAILY MORNING SUMMARY — 7:00 AM
 // ════════════════════════════════════════
-cron.schedule('0 7 * * *', async () => {
-  const now      = nowInTZ();
-  const today    = dateStr(now);
-  const plus3    = dateStr(new Date(now.getTime() + 3*86400000));
-  const days     = ['الأحد','الاثنين','الثلاثاء','الأربعاء','الخميس','الجمعة','السبت'];
-  const tasks    = readJSON(TASKS_FILE,     []);
-  const sessions = readJSON(SESSIONS_FILE,  []);
-  const deadlines= readJSON(DEADLINES_FILE, []);
-  const months   = ['يناير','فبراير','مارس','أبريل','مايو','يونيو','يوليو','أغسطس','سبتمبر','أكتوبر','نوفمبر','ديسمبر'];
 
-  let text = `🌅 *الملخص الصباحي*\n📅 ${days[now.getDay()]}، ${now.getDate()} ${months[now.getMonth()]} ${now.getFullYear()}\n`;
+const MOTIVATIONAL_QUOTES = [
+  'كل يوم هو فرصة جديدة لتحقيق ما أخفقت فيه أمس',
+  'الإعداد الجيد لليوم هو انتصارك المضمون في قاعة المحكمة',
+  'المحامي الناجح يبني نجاحه بالاستعداد الدقيق لا بالارتجال',
+  'لا تؤجّل ما يمكن إنجازه اليوم، فالمواعيد القانونية لا تنتظر أحداً',
+  'كل ملف قانوني يحمل قصة إنسانية تستحق أفضل دفاع ممكن',
+  'الاتقان في التفاصيل الصغيرة هو ما يصنع الفرق في القضايا الكبيرة',
+  'كل موكل يثق فيك هو تكريم مهني — صُن هذه الثقة بالإعداد والإتقان',
+  'النجاح يُبنى يوماً بعد يوم والتميز هو نتيجة عادات يومية صحيحة',
+  'من أتقن يومه أتقن حياته ومن أهمل يومه أهمل مستقبله',
+  'العدالة الحقيقية تبدأ من مكتبك قبل أن تصل إلى قاعة المحاكمة',
+  'الوقت رأس المال الحقيقي للمحامي — استثمره فيما يُثمر ويُدوم',
+  'كل تحدٍّ قانوني هو فرصة لإثبات كفاءتك وصقل خبرتك',
+  'الصبر والمثابرة يحوّلان القضايا الصعبة إلى انتصارات ممكنة',
+  'ابدأ يومك بنية صادقة وستجد أن الصعاب تتراجع أمام عزيمتك',
+  'الاستعداد المبكر للجلسة هو نصف الانتصار فيها',
+];
 
-  // Today's sessions
-  const todaySess = sessions.filter(s=>s.date===today).sort((a,b)=>a.time.localeCompare(b.time));
+const DAYS_AR   = ['الأحد','الاثنين','الثلاثاء','الأربعاء','الخميس','الجمعة','السبت'];
+const MONTHS_AR = ['يناير','فبراير','مارس','أبريل','مايو','يونيو',
+                   'يوليو','أغسطس','سبتمبر','أكتوبر','نوفمبر','ديسمبر'];
+const PRI_ICON  = { high: '🔴', medium: '🟡', low: '🟢' };
+
+function buildDailySummary(now, tasks, sessions, deadlines) {
+  const today  = dateStr(now);
+  const plus3  = dateStr(new Date(now.getTime() + 3 * 86400000));
+
+  // اختيار رسالة تحفيزية بناءً على رقم اليوم في السنة
+  const dayOfYear = Math.floor((now - new Date(now.getFullYear(), 0, 0)) / 86400000);
+  const quote     = MOTIVATIONAL_QUOTES[dayOfYear % MOTIVATIONAL_QUOTES.length];
+
+  // ── بناء الرسالة ──
+  let msg = '';
+
+  // العنوان والتاريخ
+  msg += `🌅 *صباح الخير ⚖️*\n`;
+  msg += `📅 *${DAYS_AR[now.getDay()]}، ${now.getDate()} ${MONTHS_AR[now.getMonth()]} ${now.getFullYear()}*\n`;
+  msg += `\n_"${quote}"_\n`;
+  msg += `\n${SEP}\n`;
+
+  // 1. جلسات اليوم
+  const todaySess = sessions
+    .filter(s => s.date === today)
+    .sort((a, b) => (a.time || '').localeCompare(b.time || ''));
+
   if (todaySess.length) {
-    text += `\n🏛️ *جلسات اليوم (${todaySess.length}):*\n`;
-    todaySess.forEach(s => { text += `• ${s.time} — ${s.client} | ${s.court}${s.caseNum?' | '+s.caseNum:''}\n`; });
+    msg += `\n🏛️ *جلسات اليوم — ${todaySess.length} جلسة:*\n`;
+    todaySess.forEach(s => {
+      msg += `\n▪️ *${s.time || '—'}* — ${s.client || '—'}\n`;
+      if (s.court)   msg += `   🏛️ ${s.court}\n`;
+      if (s.caseNum) msg += `   📋 القضية: ${s.caseNum}\n`;
+      if (s.sessType) msg += `   🏷️ ${s.sessType}\n`;
+      if (s.notes)   msg += `   📝 ${s.notes}\n`;
+    });
+  } else {
+    msg += `\n🏛️ *جلسات اليوم:* لا توجد جلسات\n`;
   }
 
-  // Today's tasks (due today + daily)
-  const todayTasks = tasks.filter(t=>!t.completed&&(t.dueDate===today||(!t.dueDate&&t.category==='daily')));
+  // 2. مهام اليوم (يومية + مجدولة لهذا اليوم)
+  const todayTasks = tasks
+    .filter(t => !t.completed && (
+      t.dueDate === today ||
+      (!t.dueDate && t.category === 'daily')
+    ))
+    .sort((a, b) => {
+      const p = { high: 0, medium: 1, low: 2 };
+      return (p[a.priority] ?? 1) - (p[b.priority] ?? 1);
+    });
+
+  msg += `\n${SEP}\n`;
   if (todayTasks.length) {
-    text += `\n📋 *مهام اليوم (${todayTasks.length}):*\n`;
-    todayTasks.slice(0,6).forEach(t=>{ text+=`• ${t.title}${t.priority==='high'?' 🔴':''}\n`; });
-    if(todayTasks.length>6) text+=`...و${todayTasks.length-6} مهام أخرى\n`;
+    msg += `\n📋 *مهام اليوم — ${todayTasks.length} مهمة:*\n`;
+    todayTasks.slice(0, 8).forEach(t => {
+      const icon = PRI_ICON[t.priority] || '⚪';
+      msg += `• ${icon} ${t.title}`;
+      if (t.dueTime) msg += ` 🕐 ${t.dueTime}`;
+      if (t.subcategory) msg += ` _(${t.subcategory})_`;
+      msg += '\n';
+    });
+    if (todayTasks.length > 8) msg += `_...و${todayTasks.length - 8} مهام أخرى_\n`;
+  } else {
+    msg += `\n📋 *مهام اليوم:* لا توجد مهام مجدولة\n`;
   }
 
-  // Deadlines next 3 days
-  const nearDls = deadlines.filter(d => d.deadline >= today && d.deadline <= plus3)
-    .sort((a,b)=>a.deadline.localeCompare(b.deadline));
+  // 3. المواعيد القانونية المنتهية خلال 3 أيام
+  const nearDls = deadlines
+    .filter(d => d.deadline >= today && d.deadline <= plus3)
+    .sort((a, b) => a.deadline.localeCompare(b.deadline));
+
+  msg += `\n${SEP}\n`;
   if (nearDls.length) {
-    text += `\n⚖️ *مواعيد قانونية خلال 3 أيام (${nearDls.length}):*\n`;
+    msg += `\n⚖️ *مواعيد قانونية قادمة خلال 3 أيام — ${nearDls.length}:*\n`;
     nearDls.forEach(d => {
-      const diffMs = new Date(d.deadline+'T09:00:00').getTime() - now.getTime();
-      const diff   = Math.round(diffMs/86400000);
-      const [y,m,dd]=d.deadline.split('-').map(Number);
-      text += `• ${d.name} — ${dd}/${m}/${y} ${diff===0?'(اليوم!)':diff===1?'(غداً)':'('+diff+' أيام)'}\n`;
+      const [dy, dm, dd] = (d.deadline || '').split('-').map(Number);
+      const diffMs = new Date(dy, dm - 1, dd, 9, 0, 0).getTime() - now.getTime();
+      const diff   = Math.round(diffMs / 86400000);
+      const when   = diff <= 0 ? '⚠️ *اليوم!*' : diff === 1 ? '⏰ *غداً*' : `📅 بعد ${diff} أيام`;
+      msg += `\n▪️ *${d.name}*\n`;
+      msg += `   ${when} — ${dd}/${dm}/${dy}\n`;
+      if (d.category) msg += `   🏷️ ${d.category}\n`;
+      if (d.notes)    msg += `   📝 ${d.notes}\n`;
     });
+  } else {
+    msg += `\n⚖️ *مواعيد قانونية قادمة:* لا توجد خلال 3 أيام\n`;
   }
 
-  // Overdue tasks
-  const overdue = tasks.filter(t=>!t.completed&&t.dueDate&&t.dueDate<today);
+  // 4. المهام المتأخرة
+  const overdue = tasks
+    .filter(t => !t.completed && t.dueDate && t.dueDate < today)
+    .sort((a, b) => a.dueDate.localeCompare(b.dueDate));
+
+  msg += `\n${SEP}\n`;
   if (overdue.length) {
-    text += `\n⏰ *مهام متأخرة (${overdue.length}):*\n`;
-    overdue.slice(0,5).forEach(t => {
-      const d=Math.abs(Math.round((new Date(t.dueDate+'T12:00:00').getTime()-now.getTime())/86400000));
-      text+=`• ${t.title} (منذ ${d} يوم)\n`;
+    msg += `\n⏰ *مهام متأخرة — ${overdue.length} مهمة:*\n`;
+    overdue.slice(0, 6).forEach(t => {
+      const d = Math.abs(Math.round(
+        (new Date(t.dueDate + 'T12:00:00').getTime() - now.getTime()) / 86400000
+      ));
+      const icon = PRI_ICON[t.priority] || '⚪';
+      msg += `• ${icon} ${t.title} _(منذ ${d} يوم)_\n`;
     });
-    if(overdue.length>5) text+=`...و${overdue.length-5} مهام أخرى\n`;
+    if (overdue.length > 6) msg += `_...و${overdue.length - 6} مهام أخرى متأخرة_\n`;
+  } else {
+    msg += `\n✅ *لا توجد مهام متأخرة — أحسنت!*\n`;
   }
 
-  if (!todaySess.length && !todayTasks.length && !nearDls.length && !overdue.length)
-    text += '\n✅ لا توجد بنود مجدولة اليوم — يوم منتج!\n';
+  // خلاصة إذا لا يوجد شيء
+  const isEmpty = !todaySess.length && !todayTasks.length && !nearDls.length && !overdue.length;
+  if (isEmpty) {
+    msg += `\n\n🎉 *يوم فارغ من المواعيد — استثمره في التطوير والإعداد!*\n`;
+  }
 
-  const ok = await sendTelegram(text);
-  appendLog({ event: 'daily_summary', ok, date: today });
+  msg += `\n${SEP}`;
+  return msg;
+}
+
+cron.schedule('0 7 * * *', async () => {
+  const now       = nowInTZ();
+  const today     = dateStr(now);
+  const tasks     = readJSON(TASKS_FILE,     []);
+  const sessions  = readJSON(SESSIONS_FILE,  []);
+  const deadlines = readJSON(DEADLINES_FILE, []);
+
+  console.log(`[DAILY] Building morning summary for ${today}`);
+
+  const text = buildDailySummary(now, tasks, sessions, deadlines);
+  const ok   = await sendTelegram(text);
+
+  appendLog({ event: 'daily_summary', ok, date: today,
+    stats: {
+      sessions:  sessions.filter(s => s.date === today).length,
+      tasks:     tasks.filter(t => !t.completed && (t.dueDate === today || (!t.dueDate && t.category === 'daily'))).length,
+      overdue:   tasks.filter(t => !t.completed && t.dueDate && t.dueDate < today).length,
+      deadlines: deadlines.filter(d => d.deadline >= today && d.deadline <= dateStr(new Date(now.getTime() + 3*86400000))).length,
+    }
+  });
   console.log(`[DAILY] Summary sent: ${ok}`);
 }, { timezone: TIMEZONE });
 
@@ -460,23 +561,16 @@ app.delete('/sessions/:id', (req, res) => {
 
 // ── Test & manual send ───────────────────
 // Manual daily summary trigger
+// إرسال الملخص الصباحي يدوياً للاختبار
 app.post('/daily-summary', async (_req, res) => {
-  // Re-use the cron logic inline
-  const now = nowInTZ();
-  const today = dateStr(now);
-  const plus3 = dateStr(new Date(now.getTime()+3*86400000));
-  const tasks = readJSON(TASKS_FILE,[]), sessions=readJSON(SESSIONS_FILE,[]), deadlines=readJSON(DEADLINES_FILE,[]);
-  const days=['الأحد','الاثنين','الثلاثاء','الأربعاء','الخميس','الجمعة','السبت'];
-  const months=['يناير','فبراير','مارس','أبريل','مايو','يونيو','يوليو','أغسطس','سبتمبر','أكتوبر','نوفمبر','ديسمبر'];
-  let text=`🌅 *الملخص اليومي (يدوي)*\n📅 ${days[now.getDay()]}، ${now.getDate()} ${months[now.getMonth()]} ${now.getFullYear()}\n`;
-  const ts=sessions.filter(s=>s.date===today).sort((a,b)=>a.time.localeCompare(b.time));
-  if(ts.length){text+=`\n🏛️ *جلسات اليوم (${ts.length}):*\n`;ts.forEach(s=>{text+=`• ${s.time} — ${s.client}\n`;});}
-  const tt=tasks.filter(t=>!t.completed&&(t.dueDate===today));
-  if(tt.length){text+=`\n📋 *مهام اليوم (${tt.length}):*\n`;tt.slice(0,6).forEach(t=>{text+=`• ${t.title}\n`;});}
-  const nd=deadlines.filter(d=>d.deadline>=today&&d.deadline<=plus3);
-  if(nd.length){text+=`\n⚖️ *مواعيد خلال 3 أيام (${nd.length}):*\n`;nd.forEach(d=>{text+=`• ${d.name}\n`;});}
-  const ok=await sendTelegram(text);
-  res.json({ok});
+  const now       = nowInTZ();
+  const tasks     = readJSON(TASKS_FILE,     []);
+  const sessions  = readJSON(SESSIONS_FILE,  []);
+  const deadlines = readJSON(DEADLINES_FILE, []);
+  const text      = buildDailySummary(now, tasks, sessions, deadlines);
+  const ok        = await sendTelegram(text);
+  appendLog({ event: 'daily_summary_manual', ok, date: dateStr(now) });
+  res.json({ ok, preview: text.slice(0, 200) + '...' });
 });
 
 app.post('/test', async (_req, res) => {
