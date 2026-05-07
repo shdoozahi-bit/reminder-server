@@ -47,49 +47,48 @@ function appendLog(entry) {
 // ════════════════════════════════════════
 let firestoreDB = null;
 
-// Parse service account JSON — handles all common env var formats:
-//   1. Normal single-line JSON
-//   2. Multi-line JSON (actual newlines inside the string)
-//   3. private_key with literal \n sequences (Railway / Heroku style)
-//   4. private_key with double-escaped \\n (some platforms)
 function parseServiceAccount(raw) {
-  if (!raw) throw new Error('FIREBASE_SERVICE_ACCOUNT is empty');
-
-  // Attempt 1: direct parse (works if the env var is clean JSON)
+  // محاولة 1: مباشر (JSON في سطر واحد)
   try { return JSON.parse(raw); } catch (_) {}
 
-  // Attempt 2: collapse actual newlines inside the string, then parse
-  // Some platforms store the JSON with real \n characters in the value
-  try {
-    const cleaned = raw.replace(/\n/g, '\\n');
-    return JSON.parse(cleaned);
-  } catch (_) {}
+  // محاولة 2: استبدال الأسطر الحقيقية بـ \n (Railway يحفظ الأسطر كـ newline فعلي)
+  try { return JSON.parse(raw.replace(/\n/g, '\\n')); } catch (_) {}
 
-  // Attempt 3: fix double-escaped private key then parse
-  // e.g., \\n → \n inside the private_key field
+  // محاولة 3: إصلاح \\n المضاعف ثم parse
+  try { return JSON.parse(raw.replace(/\\\\n/g, '\\n')); } catch (_) {}
+
+  // محاولة 4: إزالة كل whitespace خارج القيم ثم parse
   try {
-    const fixed = raw.replace(/\\\\n/g, '\\n');
+    // تحويل كل الأسطر الحقيقية داخل قيمة private_key فقط إلى \n
+    const fixed = raw.replace(/"private_key"\s*:\s*"([\s\S]*?)(?<!\\)"/g, (match, key) => {
+      return `"private_key":"${key.replace(/\n/g, '\\n')}"`;
+    });
     return JSON.parse(fixed);
   } catch (_) {}
 
-  // Nothing worked — show a helpful error
-  throw new Error(
-    'Could not parse FIREBASE_SERVICE_ACCOUNT as JSON. ' +
-    'Make sure you paste the raw JSON content (not the file path). ' +
-    'On Railway: paste the entire JSON as one value in the Variables tab.'
-  );
+  throw new Error('فشل parse لـ FIREBASE_SERVICE_ACCOUNT — تحقق من اللوجات أعلاه');
 }
 
 function initFirebaseAdmin() {
   const sa = process.env.FIREBASE_SERVICE_ACCOUNT;
+
+  // ── diagnostic log ──────────────────────────────────────────────────
   if (!sa) {
-    console.warn('[FIREBASE] ⚠️  FIREBASE_SERVICE_ACCOUNT not set — Firestore disabled.');
-    console.warn('[FIREBASE]    Set it in Railway Variables or .env to enable live data.');
+    console.warn('[FIREBASE] ⚠️  FIREBASE_SERVICE_ACCOUNT غير موجود في env vars');
+    console.warn('[FIREBASE]    أضفه في Railway → Variables');
     return;
   }
+  console.log('[FIREBASE] FIREBASE_SERVICE_ACCOUNT received:');
+  console.log('[FIREBASE]   length:', sa.length, 'chars');
+  console.log('[FIREBASE]   first 50:', sa.slice(0, 50).replace(/\n/g, '↵'));
+  console.log('[FIREBASE]   last  20:', sa.slice(-20).replace(/\n/g, '↵'));
+  console.log('[FIREBASE]   starts with {:', sa.trimStart().startsWith('{'));
+  // ───────────────────────────────────────────────────────────────────
+
   try {
     if (admin.apps.length === 0) {
       const serviceAccount = parseServiceAccount(sa);
+      console.log('[FIREBASE] parsed OK — project_id:', serviceAccount.project_id);
       admin.initializeApp({
         credential: admin.credential.cert(serviceAccount),
         projectId:  serviceAccount.project_id || FIREBASE_PROJECT,
