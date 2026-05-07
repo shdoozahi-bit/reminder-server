@@ -47,55 +47,30 @@ function appendLog(entry) {
 // ════════════════════════════════════════
 let firestoreDB = null;
 
-function parseServiceAccount(raw) {
-  // محاولة 1: مباشر (JSON في سطر واحد)
-  try { return JSON.parse(raw); } catch (_) {}
-
-  // محاولة 2: استبدال الأسطر الحقيقية بـ \n (Railway يحفظ الأسطر كـ newline فعلي)
-  try { return JSON.parse(raw.replace(/\n/g, '\\n')); } catch (_) {}
-
-  // محاولة 3: إصلاح \\n المضاعف ثم parse
-  try { return JSON.parse(raw.replace(/\\\\n/g, '\\n')); } catch (_) {}
-
-  // محاولة 4: إزالة كل whitespace خارج القيم ثم parse
-  try {
-    // تحويل كل الأسطر الحقيقية داخل قيمة private_key فقط إلى \n
-    const fixed = raw.replace(/"private_key"\s*:\s*"([\s\S]*?)(?<!\\)"/g, (match, key) => {
-      return `"private_key":"${key.replace(/\n/g, '\\n')}"`;
-    });
-    return JSON.parse(fixed);
-  } catch (_) {}
-
-  throw new Error('فشل parse لـ FIREBASE_SERVICE_ACCOUNT — تحقق من اللوجات أعلاه');
-}
-
 function initFirebaseAdmin() {
-  const sa = process.env.FIREBASE_SERVICE_ACCOUNT;
+  const projectId   = process.env.FIREBASE_PROJECT_ID   || FIREBASE_PROJECT;
+  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL || '';
+  const privateKey  = (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
 
-  // ── diagnostic log ──────────────────────────────────────────────────
-  if (!sa) {
-    console.warn('[FIREBASE] ⚠️  FIREBASE_SERVICE_ACCOUNT غير موجود في env vars');
-    console.warn('[FIREBASE]    أضفه في Railway → Variables');
+  console.log('[FIREBASE] project_id   :', projectId);
+  console.log('[FIREBASE] client_email :', clientEmail || '(not set)');
+  console.log('[FIREBASE] private_key  :', privateKey ? `${privateKey.slice(0, 30)}...` : '(not set)');
+
+  if (!clientEmail || !privateKey) {
+    console.warn('[FIREBASE] ⚠️  FIREBASE_CLIENT_EMAIL أو FIREBASE_PRIVATE_KEY غير موجود');
+    console.warn('[FIREBASE]    أضفهما في Railway → Variables');
     return;
   }
-  console.log('[FIREBASE] FIREBASE_SERVICE_ACCOUNT received:');
-  console.log('[FIREBASE]   length:', sa.length, 'chars');
-  console.log('[FIREBASE]   first 50:', sa.slice(0, 50).replace(/\n/g, '↵'));
-  console.log('[FIREBASE]   last  20:', sa.slice(-20).replace(/\n/g, '↵'));
-  console.log('[FIREBASE]   starts with {:', sa.trimStart().startsWith('{'));
-  // ───────────────────────────────────────────────────────────────────
 
   try {
     if (admin.apps.length === 0) {
-      const serviceAccount = parseServiceAccount(sa);
-      console.log('[FIREBASE] parsed OK — project_id:', serviceAccount.project_id);
       admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
-        projectId:  serviceAccount.project_id || FIREBASE_PROJECT,
+        credential: admin.credential.cert({ projectId, clientEmail, privateKey }),
+        projectId,
       });
     }
     firestoreDB = admin.firestore();
-    console.log(`[FIREBASE] ✅ Connected — project: ${FIREBASE_PROJECT}`);
+    console.log(`[FIREBASE] ✅ Connected — project: ${projectId}`);
   } catch (e) {
     console.error('[FIREBASE] ❌ Init failed:', e.message);
     firestoreDB = null;
