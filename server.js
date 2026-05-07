@@ -6,7 +6,6 @@ const cors    = require('cors');
 const cron    = require('node-cron');
 const fs      = require('fs');
 const path    = require('path');
-const admin   = require('firebase-admin');
 
 // ════════════════════════════════════════
 // CONFIG
@@ -16,8 +15,13 @@ const TG_TOKEN         = process.env.TG_TOKEN         || '';
 const TG_CHAT          = process.env.TG_CHAT          || '';
 const TIMEZONE         = process.env.TIMEZONE         || 'Asia/Riyadh';
 const FIREBASE_PROJECT = process.env.FIREBASE_PROJECT_ID || 'shada-task';
+const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY || '';
 
-// Local files — for notified cache and logs only
+// Firestore REST base URL — no SDK, no credentials needed
+// Works with Firestore rules: allow read: if true
+const FS_BASE = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT}/databases/(default)/documents`;
+
+// Local files — notified cache and logs only
 const DATA_DIR      = path.join(__dirname, 'data');
 const NOTIFIED_FILE = path.join(DATA_DIR, 'notified.json');
 const LOG_FILE      = path.join(DATA_DIR, 'log.json');
@@ -43,80 +47,67 @@ function appendLog(entry) {
 }
 
 // ════════════════════════════════════════
-// FIREBASE ADMIN — init from env var
+// FIRESTORE REST API — no Admin SDK needed
 // ════════════════════════════════════════
-let firestoreDB = null;
 
-function initFirebaseAdmin() {
-  const projectId   = process.env.FIREBASE_PROJECT_ID   || FIREBASE_PROJECT;
-  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL || '';
-  const privateKey  = (process.env.FIREBASE_PRIVATE_KEY || '')
-    .trim()                        // إزالة مسافات بداية/نهاية
-    .replace(/^["']|["']$/g, '')   // إزالة علامات اقتباس لو موجودة
-    .replace(/\\n/g, '\n');        // \\n → سطر جديد حقيقي
-
-  console.log('[FIREBASE] project_id   :', projectId);
-  console.log('[FIREBASE] client_email :', clientEmail || '(not set)');
-  console.log('[FIREBASE] private_key  :', privateKey ? `${privateKey.slice(0, 30)}...` : '(not set)');
-
-  if (!clientEmail || !privateKey) {
-    console.warn('[FIREBASE] ⚠️  FIREBASE_CLIENT_EMAIL أو FIREBASE_PRIVATE_KEY غير موجود');
-    console.warn('[FIREBASE]    أضفهما في Railway → Variables');
-    return;
+// Convert a Firestore REST value to a plain JS value
+function fsVal(v) {
+  if (!v) return null;
+  if ('stringValue'    in v) return v.stringValue;
+  if ('integerValue'   in v) return Number(v.integerValue);
+  if ('doubleValue'    in v) return v.doubleValue;
+  if ('booleanValue'   in v) return v.booleanValue;
+  if ('nullValue'      in v) return null;
+  if ('timestampValue' in v) return v.timestampValue;
+  if ('arrayValue'     in v) return (v.arrayValue.values || []).map(fsVal);
+  if ('mapValue'       in v) {
+    const obj = {};
+    for (const [k, fv] of Object.entries(v.mapValue.fields || {})) obj[k] = fsVal(fv);
+    return obj;
   }
-
-  try {
-    if (admin.apps.length === 0) {
-      admin.initializeApp({
-        credential: admin.credential.cert({ projectId, clientEmail, privateKey }),
-        projectId,
-      });
-    }
-    firestoreDB = admin.firestore();
-    console.log(`[FIREBASE] ✅ Connected — project: ${projectId}`);
-  } catch (e) {
-    console.error('[FIREBASE] ❌ Init failed:', e.message);
-    firestoreDB = null;
-  }
+  return null;
 }
 
-// ════════════════════════════════════════
-// FIRESTORE DATA READER
-// ════════════════════════════════════════
-
-// Read /app/{key} → returns d.data array (or null on failure)
+// Read one document from /app/{key} → return the `data` array field
 async function fsRead(key) {
-  if (!firestoreDB) return null;
+  const url = `${FS_BASE}/app/${key}${FIREBASE_API_KEY ? '?key=' + FIREBASE_API_KEY : ''}`;
   try {
-    const snap = await firestoreDB.collection('app').doc(key).get();
-    if (!snap.exists) return null;
-    const d = snap.data();
-    return Array.isArray(d?.data) ? d.data : null;
+    const res = await fetch(url);
+    if (!res.ok) {
+      const txt = await res.text();
+      console.error(`[FS] read(${key}) HTTP ${res.status}:`, txt.slice(0, 120));
+      return null;
+    }
+    const doc = await res.json();
+    if (!doc.fields) return null;
+    // The document has { data: arrayValue, deviceId: stringValue, ... }
+    const data = fsVal(doc.fields.data);
+    return Array.isArray(data) ? data : null;
   } catch (e) {
-    console.error(`[FIREBASE] read(${key}) failed:`, e.code || e.message);
+    console.error(`[FS] read(${key}) error:`, e.message);
     return null;
   }
 }
 
-// Read tasks, sessions, deadlines — always returns arrays
+// Read tasks, sessions, deadlines in parallel
 async function getAppData() {
-  if (!firestoreDB) {
-    return { tasks: [], sessions: [], deadlines: [], source: 'none' };
-  }
+  console.log(`[FS] reading from Firestore REST — project: ${FIREBASE_PROJECT}`);
   try {
     const [tasks, sessions, deadlines] = await Promise.all([
       fsRead('tasks'),
       fsRead('sessions'),
       fsRead('deadlines'),
     ]);
+    const source = (tasks || sessions || deadlines) ? 'firestore' : 'empty';
+    console.log(`[FS] source:${source} tasks:${(tasks||[]).length} sessions:${(sessions||[]).length} deadlines:${(deadlines||[]).length}`);
     return {
       tasks:     tasks     ?? [],
       sessions:  sessions  ?? [],
       deadlines: deadlines ?? [],
-      source: 'firestore',
+      source,
     };
   } catch (e) {
-    console.error('[FIREBASE] getAppData failed:', e.message);
+    console.error('[FS] getAppData error:', e.message);
     return { tasks: [], sessions: [], deadlines: [], source: 'error' };
   }
 }
@@ -475,22 +466,15 @@ app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
 // ── Firebase Status ──────────────────────
 app.get('/firebase-status', async (_req, res) => {
-  if (!firestoreDB) {
-    return res.status(503).json({
-      connected: false,
-      firebase:  false,
-      message:   'FIREBASE_CLIENT_EMAIL or FIREBASE_PRIVATE_KEY not set. Check Railway Variables.',
-    });
-  }
   try {
     const { tasks, sessions, deadlines, source } = await getAppData();
-    res.json({
-      connected: true,
-      firebase:  true,
+    const ok = source === 'firestore' || source === 'empty';
+    res.status(ok ? 200 : 503).json({
+      connected: ok,
       project:   FIREBASE_PROJECT,
+      apiKey:    FIREBASE_API_KEY ? '✅ set' : '⚠️ not set',
       source,
       counts:    { tasks: tasks.length, sessions: sessions.length, deadlines: deadlines.length },
-      message:   'Firestore connection OK',
     });
   } catch (e) {
     res.status(500).json({ connected: false, error: e.message });
@@ -555,7 +539,6 @@ app.delete('/notified', (_req, res) => {
 // ════════════════════════════════════════
 // START
 // ════════════════════════════════════════
-initFirebaseAdmin();
 
 app.listen(PORT, () => {
   console.log(`
@@ -565,7 +548,7 @@ app.listen(PORT, () => {
   🚀  Port      : ${PORT}
   🌍  Timezone  : ${TIMEZONE}
   🤖  Telegram  : ${TG_TOKEN ? '✅ configured' : '❌ set TG_TOKEN'}
-  🔥  Firebase  : ${process.env.FIREBASE_CLIENT_EMAIL ? '✅ credentials set' : '⚠️  set FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY'}
+  🔥  Firebase  : project=${FIREBASE_PROJECT} | apiKey=${FIREBASE_API_KEY ? '✅ set' : '⚠️ not set (add FIREBASE_API_KEY)'}
   📦  Project   : ${FIREBASE_PROJECT}
 
   Endpoints:
