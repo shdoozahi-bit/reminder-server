@@ -455,7 +455,7 @@ app.get('/', async (_req, res) => {
     time:       new Date().toISOString(),
     timezone:   TIMEZONE,
     telegram:   !!TG_TOKEN,
-    firebase:   !!firestoreDB,
+    firebase:   !!(process.env.FIREBASE_API_KEY && process.env.FIREBASE_PROJECT_ID),
     dataSource: source,
     counts:     { tasks: tasks.length, sessions: sessions.length, deadlines: deadlines.length },
     notified:   Object.keys(readJSON(NOTIFIED_FILE, {})).length,
@@ -506,7 +506,7 @@ app.post('/deadlines', (req, res) => {
 // ── Test & manual ────────────────────────
 app.post('/test', async (_req, res) => {
   const ok = await sendTelegram(
-    `🔔 *اختبار الإشعارات*\n\n✅ سيرفر التذكيرات يعمل\n🔥 Firebase: ${firestoreDB ? 'متصل' : 'غير متصل'}\n⏰ ${new Date().toLocaleString('ar-SA', { timeZone: TIMEZONE })}`
+    `🔔 *اختبار الإشعارات*\n\n✅ سيرفر التذكيرات يعمل\n🔥 Firebase: ${(FIREBASE_PROJECT && FIREBASE_API_KEY) ? 'متصل' : 'غير متصل'}\n⏰ ${new Date().toLocaleString('ar-SA', { timeZone: TIMEZONE })}`
   );
   res.json({ ok });
 });
