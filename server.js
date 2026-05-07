@@ -50,7 +50,10 @@ let firestoreDB = null;
 function initFirebaseAdmin() {
   const projectId   = process.env.FIREBASE_PROJECT_ID   || FIREBASE_PROJECT;
   const clientEmail = process.env.FIREBASE_CLIENT_EMAIL || '';
-  const privateKey  = (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+  const privateKey  = (process.env.FIREBASE_PRIVATE_KEY || '')
+    .trim()                        // إزالة مسافات بداية/نهاية
+    .replace(/^["']|["']$/g, '')   // إزالة علامات اقتباس لو موجودة
+    .replace(/\\n/g, '\n');        // \\n → سطر جديد حقيقي
 
   console.log('[FIREBASE] project_id   :', projectId);
   console.log('[FIREBASE] client_email :', clientEmail || '(not set)');
