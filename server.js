@@ -476,7 +476,7 @@ app.get('/firebase-status', async (_req, res) => {
     return res.status(503).json({
       connected: false,
       firebase:  false,
-      message:   'FIREBASE_SERVICE_ACCOUNT not set or invalid. Check Railway Variables.',
+      message:   'FIREBASE_CLIENT_EMAIL or FIREBASE_PRIVATE_KEY not set. Check Railway Variables.',
     });
   }
   try {
@@ -562,7 +562,7 @@ app.listen(PORT, () => {
   🚀  Port      : ${PORT}
   🌍  Timezone  : ${TIMEZONE}
   🤖  Telegram  : ${TG_TOKEN ? '✅ configured' : '❌ set TG_TOKEN'}
-  🔥  Firebase  : ${process.env.FIREBASE_SERVICE_ACCOUNT ? '✅ service account set' : '⚠️  set FIREBASE_SERVICE_ACCOUNT'}
+  🔥  Firebase  : ${process.env.FIREBASE_CLIENT_EMAIL ? '✅ credentials set' : '⚠️  set FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY'}
   📦  Project   : ${FIREBASE_PROJECT}
 
   Endpoints:
