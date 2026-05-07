@@ -1,26 +1,26 @@
+'use strict';
 require('dotenv').config();
+
 const express = require('express');
 const cors    = require('cors');
 const cron    = require('node-cron');
 const fs      = require('fs');
 const path    = require('path');
+const admin   = require('firebase-admin');
 
 // ════════════════════════════════════════
 // CONFIG
 // ════════════════════════════════════════
-const PORT      = process.env.PORT      || 3001;
-const TG_TOKEN  = process.env.TG_TOKEN  || '';
-const TG_CHAT   = process.env.TG_CHAT   || '';
-const TIMEZONE  = process.env.TIMEZONE  || 'Asia/Riyadh';
+const PORT             = process.env.PORT             || 3001;
+const TG_TOKEN         = process.env.TG_TOKEN         || '';
+const TG_CHAT          = process.env.TG_CHAT          || '';
+const TIMEZONE         = process.env.TIMEZONE         || 'Asia/Riyadh';
+const FIREBASE_PROJECT = process.env.FIREBASE_PROJECT_ID || 'shada-task';
 
-const DATA_DIR        = path.join(__dirname, 'data');
-const TASKS_FILE      = path.join(DATA_DIR, 'tasks.json');
-const SESSIONS_FILE   = path.join(DATA_DIR, 'sessions.json');
-const DEADLINES_FILE  = path.join(DATA_DIR, 'deadlines.json');
-const SUBCATS_FILE    = path.join(DATA_DIR, 'subcats.json');
-const NOTIFIED_FILE   = path.join(DATA_DIR, 'notified.json');
-const LOG_FILE        = path.join(DATA_DIR, 'log.json');
-
+// Local files — for notified cache and logs only
+const DATA_DIR      = path.join(__dirname, 'data');
+const NOTIFIED_FILE = path.join(DATA_DIR, 'notified.json');
+const LOG_FILE      = path.join(DATA_DIR, 'log.json');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // ════════════════════════════════════════
@@ -32,46 +32,135 @@ function readJSON(file, fallback) {
     return JSON.parse(fs.readFileSync(file, 'utf8'));
   } catch { return fallback; }
 }
-
 function writeJSON(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
 }
-
 function appendLog(entry) {
   const logs = readJSON(LOG_FILE, []);
   logs.unshift({ ...entry, ts: new Date().toISOString() });
-  if (logs.length > 200) logs.splice(200);
+  if (logs.length > 500) logs.splice(500);
   writeJSON(LOG_FILE, logs);
+}
+
+// ════════════════════════════════════════
+// FIREBASE ADMIN — init from env var
+// ════════════════════════════════════════
+let firestoreDB = null;
+
+// Parse service account JSON — handles all common env var formats:
+//   1. Normal single-line JSON
+//   2. Multi-line JSON (actual newlines inside the string)
+//   3. private_key with literal \n sequences (Railway / Heroku style)
+//   4. private_key with double-escaped \\n (some platforms)
+function parseServiceAccount(raw) {
+  if (!raw) throw new Error('FIREBASE_SERVICE_ACCOUNT is empty');
+
+  // Attempt 1: direct parse (works if the env var is clean JSON)
+  try { return JSON.parse(raw); } catch (_) {}
+
+  // Attempt 2: collapse actual newlines inside the string, then parse
+  // Some platforms store the JSON with real \n characters in the value
+  try {
+    const cleaned = raw.replace(/\n/g, '\\n');
+    return JSON.parse(cleaned);
+  } catch (_) {}
+
+  // Attempt 3: fix double-escaped private key then parse
+  // e.g., \\n → \n inside the private_key field
+  try {
+    const fixed = raw.replace(/\\\\n/g, '\\n');
+    return JSON.parse(fixed);
+  } catch (_) {}
+
+  // Nothing worked — show a helpful error
+  throw new Error(
+    'Could not parse FIREBASE_SERVICE_ACCOUNT as JSON. ' +
+    'Make sure you paste the raw JSON content (not the file path). ' +
+    'On Railway: paste the entire JSON as one value in the Variables tab.'
+  );
+}
+
+function initFirebaseAdmin() {
+  const sa = process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (!sa) {
+    console.warn('[FIREBASE] ⚠️  FIREBASE_SERVICE_ACCOUNT not set — Firestore disabled.');
+    console.warn('[FIREBASE]    Set it in Railway Variables or .env to enable live data.');
+    return;
+  }
+  try {
+    if (admin.apps.length === 0) {
+      const serviceAccount = parseServiceAccount(sa);
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+        projectId:  serviceAccount.project_id || FIREBASE_PROJECT,
+      });
+    }
+    firestoreDB = admin.firestore();
+    console.log(`[FIREBASE] ✅ Connected — project: ${FIREBASE_PROJECT}`);
+  } catch (e) {
+    console.error('[FIREBASE] ❌ Init failed:', e.message);
+    firestoreDB = null;
+  }
+}
+
+// ════════════════════════════════════════
+// FIRESTORE DATA READER
+// ════════════════════════════════════════
+
+// Read /app/{key} → returns d.data array (or null on failure)
+async function fsRead(key) {
+  if (!firestoreDB) return null;
+  try {
+    const snap = await firestoreDB.collection('app').doc(key).get();
+    if (!snap.exists) return null;
+    const d = snap.data();
+    return Array.isArray(d?.data) ? d.data : null;
+  } catch (e) {
+    console.error(`[FIREBASE] read(${key}) failed:`, e.code || e.message);
+    return null;
+  }
+}
+
+// Read tasks, sessions, deadlines — always returns arrays
+async function getAppData() {
+  if (!firestoreDB) {
+    return { tasks: [], sessions: [], deadlines: [], source: 'none' };
+  }
+  try {
+    const [tasks, sessions, deadlines] = await Promise.all([
+      fsRead('tasks'),
+      fsRead('sessions'),
+      fsRead('deadlines'),
+    ]);
+    return {
+      tasks:     tasks     ?? [],
+      sessions:  sessions  ?? [],
+      deadlines: deadlines ?? [],
+      source: 'firestore',
+    };
+  } catch (e) {
+    console.error('[FIREBASE] getAppData failed:', e.message);
+    return { tasks: [], sessions: [], deadlines: [], source: 'error' };
+  }
 }
 
 // ════════════════════════════════════════
 // TELEGRAM
 // ════════════════════════════════════════
-async function sendTelegram(text, silent = false) {
-  if (!TG_TOKEN || !TG_CHAT) {
-    console.warn('[TG] ⚠️  Not configured. Set TG_TOKEN and TG_CHAT in .env');
-    return false;
-  }
+async function sendTelegram(text) {
+  if (!TG_TOKEN || !TG_CHAT) return false;
   try {
     const res = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-      method: 'POST',
+      method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id:              TG_CHAT,
-        text,
-        parse_mode:           'Markdown',
-        disable_notification: silent
-      })
+      body:    JSON.stringify({ chat_id: TG_CHAT, text, parse_mode: 'Markdown' }),
     });
-    const data = await res.json();
-    if (data.ok) {
-      console.log(`[TG] ✅ Sent: ${text.substring(0, 60).replace(/\n/g, ' ')}`);
-    } else {
-      console.error(`[TG] ❌ Error: ${data.description}`);
-    }
-    return data.ok === true;
+    const j = await res.json();
+    if (j.ok) console.log('[TG] ✅', text.slice(0, 60).replace(/\n/g, ' '));
+    else      console.error('[TG] ❌', j.description);
+    return j.ok === true;
   } catch (e) {
-    console.error(`[TG] ❌ Fetch error: ${e.message}`);
+    console.error('[TG] ❌ fetch error:', e.message);
     return false;
   }
 }
@@ -80,25 +169,15 @@ async function sendTelegram(text, silent = false) {
 // DATE UTILS
 // ════════════════════════════════════════
 function nowInTZ() {
-  // Returns current time as a Date interpreted in the configured timezone
   return new Date(new Date().toLocaleString('en-US', { timeZone: TIMEZONE }));
 }
-
 function pad2(n) { return String(n).padStart(2, '0'); }
-
-function dateStr(d) {
-  return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`;
-}
-
-function timeStr(d) {
-  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
-}
-
-function diffMinutes(dateA, timeA, now) {
-  const [y, m, d]  = dateA.split('-').map(Number);
-  const [h, mi]    = timeA.split(':').map(Number);
-  const target     = new Date(y, m-1, d, h, mi, 0, 0);
-  return Math.round((target - now) / 60000);
+function dateStr(d) { return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`; }
+function timeStr(d) { return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`; }
+function diffMins(dateA, timeA, now) {
+  const [y,m,d] = dateA.split('-').map(Number);
+  const [h,mi]  = timeA.split(':').map(Number);
+  return Math.round((new Date(y, m-1, d, h, mi) - now) / 60000);
 }
 
 // ════════════════════════════════════════
@@ -106,21 +185,21 @@ function diffMinutes(dateA, timeA, now) {
 // ════════════════════════════════════════
 const CAT_AR = { daily:'☀️ يومية', weekly:'📅 أسبوعية', monthly:'🗓️ شهرية', yearly:'🎯 سنوية', once:'📌 مرة واحدة' };
 const PRI_AR = { high:'🔴 عالية', medium:'🟡 متوسطة', low:'🟢 منخفضة' };
+const PRI_IC = { high:'🔴', medium:'🟡', low:'🟢' };
 const SEP    = '━━━━━━━━━━━━━━━━━━';
 
-function fmtTask(task, headerOverride) {
+function fmtTask(task, header) {
   const [y,mo,d] = (task.dueDate||'').split('-').map(Number);
-  let t = headerOverride ? `${headerOverride}\n\n` : `📋 *تذكير بمهمة*\n\n`;
-  t += `📌 *${task.title}*\n${SEP}`;
-  t += `\n📂 *التصنيف:* ${CAT_AR[task.category] || task.category}`;
+  let t = (header || '📋 *تذكير بمهمة*') + `\n\n📌 *${task.title}*\n${SEP}`;
+  t += `\n📂 *التصنيف:* ${CAT_AR[task.category]||task.category}`;
   if (task.subcategory) t += ` › ${task.subcategory}`;
   t += `\n${PRI_AR[task.priority]||''} *الأولوية*`;
-  if (task.dueDate || task.dueTime) {
+  if (task.dueDate||task.dueTime) {
     t += `\n⏰ *الموعد:*`;
     if (task.dueDate) t += ` ${d}/${mo}/${y}`;
     if (task.dueTime) t += ` 🕐 ${task.dueTime}`;
   }
-  if (task.description) t += `\n📝 *ملاحظات:* ${task.description}`;
+  if (task.description)   t += `\n📝 *ملاحظات:* ${task.description}`;
   if (task.checklist?.length) {
     const done = task.checklist.filter(x => x.done).length;
     t += `\n✅ *قائمة المراجعة:* ${done}/${task.checklist.length} خطوة`;
@@ -128,16 +207,16 @@ function fmtTask(task, headerOverride) {
   return t;
 }
 
-function fmtSession(session, when) {
-  const headers = {
-    now:    `🔔 *موعد الجلسة الآن*`,
-    '1hour': `⚠️ *تذكير عاجل — الجلسة بعد ساعة*`,
-    '1day':  `🏛️ *تذكير بجلسة — غداً*`
+function fmtSession(session, when, header) {
+  const hdrs = {
+    now:    '🔔 *موعد الجلسة الآن*',
+    '1hour':'⚠️ *تذكير عاجل — الجلسة بعد ساعة*',
+    '1day': '🏛️ *تذكير بجلسة — غداً*',
   };
   const [y,m,d] = (session.date||'').split('-').map(Number);
-  let t = `${headers[when]||'🏛️ *تذكير بجلسة*'}\n\n${SEP}`;
-  t += `\n👤 *الموكل:* ${session.client||session.title||''}`;
-  if (session.sessType || session.type) t += `\n🏷️ *نوع الجلسة:* ${session.sessType||session.type}`;
+  let t = (header || hdrs[when] || '🏛️ *تذكير بجلسة*') + `\n\n${SEP}`;
+  t += `\n👤 *الموكل:* ${session.client||''}`;
+  if (session.sessType) t += `\n🏷️ *نوع الجلسة:* ${session.sessType}`;
   if (session.caseNum)  t += `\n📋 *رقم القضية:* ${session.caseNum}`;
   if (session.court)    t += `\n🏛️ *المحكمة:* ${session.court}`;
   if (session.date)     t += `\n📅 *التاريخ:* ${d}/${m}/${y}`;
@@ -146,12 +225,23 @@ function fmtSession(session, when) {
   return t;
 }
 
+function fmtDeadline(dl, header) {
+  const [y,m,d] = (dl.deadline||'').split('-').map(Number);
+  const diffDays = Math.round((new Date(y,m-1,d,9,0) - nowInTZ()) / 86400000);
+  let t = (header || '⚖️ *تذكير بميعاد قانوني*') + `\n\n📌 *${dl.name}*\n${SEP}`;
+  if (dl.category)    t += `\n🏷️ *النوع:* ${dl.category}`;
+  t += `\n📅 *تاريخ الانتهاء:* ${d}/${m}/${y}`;
+  t += `\n${diffDays <= 0 ? '❌ انتهى' : diffDays === 1 ? '⏰ غداً' : `⏳ متبقٍ ${diffDays} يوم`}`;
+  if (dl.notes) t += `\n📝 *ملاحظات:* ${dl.notes}`;
+  return t;
+}
+
 // ════════════════════════════════════════
 // RECURRENCE CHECK
 // ════════════════════════════════════════
 function shouldNotifyToday(task, today) {
   switch (task.category) {
-    case 'daily': return true;
+    case 'daily':  return true;
     case 'weekly': {
       if (!task.dueDate) return true;
       const [y,m,d] = task.dueDate.split('-').map(Number);
@@ -159,150 +249,129 @@ function shouldNotifyToday(task, today) {
     }
     case 'monthly': {
       if (!task.dueDate) return true;
-      const [,,d] = task.dueDate.split('-').map(Number);
-      return today.getDate() === d;
+      return today.getDate() === Number(task.dueDate.split('-')[2]);
     }
     case 'yearly': {
       if (!task.dueDate) return true;
       const [,m,d] = task.dueDate.split('-').map(Number);
-      return today.getMonth()+1===m && today.getDate()===d;
+      return today.getMonth()+1 === m && today.getDate() === d;
     }
     case 'once':
-      return task.dueDate ? task.dueDate === dateStr(today) : false;
+      return task.dueDate === dateStr(today);
     default: return false;
   }
 }
 
 // ════════════════════════════════════════
-// CRON — every minute
+// CRON — كل دقيقة: تحقق من التذكيرات
 // ════════════════════════════════════════
 cron.schedule('* * * * *', async () => {
   const now      = nowInTZ();
-  const todayStr = dateStr(now);
+  const today    = dateStr(now);
   const nowTime  = timeStr(now);
+  const nowMin   = Math.floor(now.getTime() / 60000);
 
-  const tasks     = readJSON(TASKS_FILE,     []);
-  const sessions  = readJSON(SESSIONS_FILE,  []);
-  const deadlines = readJSON(DEADLINES_FILE, []);
-  const notified  = readJSON(NOTIFIED_FILE,  {});
-  let   changed   = false;
-  const fired     = [];
-  const nowMin    = Math.floor(now.getTime() / 60000);
+  const { tasks, sessions, deadlines, source } = await getAppData();
+  if (!tasks.length && !sessions.length && !deadlines.length) return;
 
-  // ── Custom reminder helper ──────────────
-  const RMS = { minutes:60000, hours:3600000, days:86400000 };
-  const UNT_AR_S = { minutes:'دقيقة', hours:'ساعة', days:'يوم' };
+  const notified = readJSON(NOTIFIED_FILE, {});
+  let changed    = false;
+  const fired    = [];
 
-  function reminderMs(r) { return Number(r.amount) * (RMS[r.unit] || 0); }
-  function fmtR(r) { return `قبل ${r.amount} ${UNT_AR_S[r.unit]||''}`; }
+  console.log(`[CRON] ${today} ${nowTime} | ${source} | tasks:${tasks.length} sessions:${sessions.length} deadlines:${deadlines.length}`);
 
-  async function checkCustomReminder(type, item, dueMs, dateKey) {
-    for (const r of (item.reminders || [])) {
-      if (!r.amount || !r.unit) continue;
-      const fireMin = Math.floor((dueMs - reminderMs(r)) / 60000);
-      if (fireMin !== nowMin) continue;
-      const key = `cr-${type}-${item.id}-r${r.id}-${dateKey}`;
-      if (notified[key]) continue;
-
-      const hdr = `⏰ *تذكير — ${fmtR(r)} من الآن*`;
-      let text;
-      if      (type==='task')     text = fmtTask(item, hdr);
-      else if (type==='session')  text = fmtSession(item, null, hdr);
-      else if (type==='deadline') {
-        const [y,m,d]=(item.deadline||'').split('-').map(Number);
-        text = `${hdr}\n\n📌 *${item.name}*\n${SEP}`;
-        if (item.category) text += `\n🏷️ *النوع:* ${item.category}`;
-        text += `\n📅 *تاريخ الانتهاء:* ${d}/${m}/${y}`;
-        if (item.notes) text += `\n📝 *ملاحظات:* ${item.notes}`;
-      } else continue;
-
-      const ok = await sendTelegram(text);
-      if (ok !== false) {
-        notified[key] = now.toISOString();
-        fired.push({ type: `custom-${type}`, id: item.id, reminder: fmtR(r) });
-        changed = true;
-      }
-    }
-  }
-
-  // ── Task reminders ──────────────────────
+  // ── 1. تذكيرات المهام عند موعدها ──────────
   for (const task of tasks) {
     if (task.completed || !task.dueTime) continue;
-
-    const key = `t-${task.id}-${todayStr}`;
-    if (notified[key]) continue;
-    if (task.dueTime !== nowTime) continue;
+    const key = `t-${task.id}-${today}`;
+    if (notified[key] || task.dueTime !== nowTime) continue;
     if (!shouldNotifyToday(task, now)) continue;
 
     const ok = await sendTelegram(fmtTask(task));
-    if (ok !== false) {
-      notified[key] = now.toISOString();
-      fired.push({ type: 'task', title: task.title, when: 'now' });
-      changed = true;
-    }
+    if (ok) { notified[key] = now.toISOString(); fired.push({ type:'task', id:task.id }); changed = true; }
   }
 
-  // ── Session reminders ───────────────────
-  for (const session of sessions) {
-    if (!session.date || !session.time) continue;
-
-    const diffMins = diffMinutes(session.date, session.time, now);
-
+  // ── 2. تذكيرات الجلسات (الآن، ساعة، يوم) ──
+  for (const s of sessions) {
+    if (!s.date || !s.time) continue;
+    const diff = diffMins(s.date, s.time, now);
     const checks = [
-      { key: `s-${session.id}-now`,    match: diffMins === 0,                    when: 'now'    },
-      { key: `s-${session.id}-1hour`,  match: diffMins >= 59 && diffMins <= 61,  when: '1hour'  },
-      { key: `s-${session.id}-1day`,   match: diffMins >= 1439 && diffMins <= 1441, when: '1day' }
+      { key:`s-${s.id}-now`,   match: diff === 0,                  when:'now'   },
+      { key:`s-${s.id}-1h`,    match: diff >= 59 && diff <= 61,    when:'1hour' },
+      { key:`s-${s.id}-1d`,    match: diff >= 1439 && diff <= 1441, when:'1day' },
     ];
-
     for (const { key, match, when } of checks) {
       if (!match || notified[key]) continue;
-      const ok = await sendTelegram(fmtSession(session, when));
-      if (ok !== false) {
-        notified[key] = now.toISOString();
-        fired.push({ type: 'session', title: session.title, when });
-        changed = true;
-      }
+      const ok = await sendTelegram(fmtSession(s, when));
+      if (ok) { notified[key] = now.toISOString(); fired.push({ type:'session', id:s.id, when }); changed = true; }
     }
   }
 
-  // ── Custom reminders (tasks) ─────────────
+  // ── 3. تذكيرات مخصصة (tasks) ──────────────
+  const RMS = { minutes:60000, hours:3600000, days:86400000 };
+  const U_AR = { minutes:'دقيقة', hours:'ساعة', days:'يوم' };
+  const fmtR = r => `قبل ${r.amount} ${U_AR[r.unit]||''}`;
+
   for (const task of tasks) {
     if (task.completed || !task.dueDate || !task.dueTime || !task.reminders?.length) continue;
-    const [y,m,d]=task.dueDate.split('-').map(Number), [h,mi]=task.dueTime.split(':').map(Number);
-    const dueMs = new Date(y,m-1,d,h,mi,0,0).getTime();
-    await checkCustomReminder('task', task, dueMs, task.dueDate);
+    const [y,m,d] = task.dueDate.split('-').map(Number);
+    const [h,mi]  = task.dueTime.split(':').map(Number);
+    const dueMs   = new Date(y,m-1,d,h,mi).getTime();
+    for (const r of task.reminders) {
+      if (!r.amount || !r.unit) continue;
+      const fireMin = Math.floor((dueMs - r.amount * (RMS[r.unit]||0)) / 60000);
+      if (fireMin !== nowMin) continue;
+      const key = `cr-t-${task.id}-${r.id}-${task.dueDate}`;
+      if (notified[key]) continue;
+      const ok = await sendTelegram(fmtTask(task, `⏰ *تذكير — ${fmtR(r)} من الآن*`));
+      if (ok) { notified[key] = now.toISOString(); fired.push({ type:'custom-task', id:task.id }); changed = true; }
+    }
   }
 
-  // ── Custom reminders (sessions) ──────────
-  for (const sess of sessions) {
-    if (!sess.date || !sess.time || !sess.reminders?.length) continue;
-    const [y,m,d]=sess.date.split('-').map(Number), [h,mi]=sess.time.split(':').map(Number);
-    const dueMs = new Date(y,m-1,d,h,mi,0,0).getTime();
-    await checkCustomReminder('session', sess, dueMs, sess.date);
+  // ── 4. تذكيرات مخصصة (sessions) ───────────
+  for (const s of sessions) {
+    if (!s.date || !s.time || !s.reminders?.length) continue;
+    const [y,m,d] = s.date.split('-').map(Number);
+    const [h,mi]  = s.time.split(':').map(Number);
+    const dueMs   = new Date(y,m-1,d,h,mi).getTime();
+    for (const r of s.reminders) {
+      if (!r.amount || !r.unit) continue;
+      const fireMin = Math.floor((dueMs - r.amount * (RMS[r.unit]||0)) / 60000);
+      if (fireMin !== nowMin) continue;
+      const key = `cr-s-${s.id}-${r.id}-${s.date}`;
+      if (notified[key]) continue;
+      const ok = await sendTelegram(fmtSession(s, null, `⏰ *تذكير — ${fmtR(r)} من الآن*`));
+      if (ok) { notified[key] = now.toISOString(); fired.push({ type:'custom-session', id:s.id }); changed = true; }
+    }
   }
 
-  // ── Custom reminders (deadlines, anchor 09:00) ──
+  // ── 5. تذكيرات مخصصة (deadlines, anchor 09:00) ─
   for (const dl of deadlines) {
     if (!dl.deadline || !dl.reminders?.length) continue;
-    const [y,m,d]=dl.deadline.split('-').map(Number);
-    const dueMs = new Date(y,m-1,d,9,0,0,0).getTime();
-    await checkCustomReminder('deadline', dl, dueMs, dl.deadline);
+    const [y,m,d] = dl.deadline.split('-').map(Number);
+    const dueMs   = new Date(y,m-1,d,9,0,0).getTime();
+    for (const r of dl.reminders) {
+      if (!r.amount || !r.unit) continue;
+      const fireMin = Math.floor((dueMs - r.amount * (RMS[r.unit]||0)) / 60000);
+      if (fireMin !== nowMin) continue;
+      const key = `cr-dl-${dl.id}-${r.id}-${dl.deadline}`;
+      if (notified[key]) continue;
+      const ok = await sendTelegram(fmtDeadline(dl, `⏰ *تذكير — ${fmtR(r)} من الآن*`));
+      if (ok) { notified[key] = now.toISOString(); fired.push({ type:'custom-deadline', id:dl.id }); changed = true; }
+    }
   }
 
   if (changed) writeJSON(NOTIFIED_FILE, notified);
-
   if (fired.length) {
-    appendLog({ event: 'notifications_sent', count: fired.length, fired });
+    appendLog({ event:'reminders_fired', count:fired.length, fired });
+    console.log(`[CRON] 🔔 fired ${fired.length} reminders`);
   }
-
-  console.log(`[${todayStr} ${nowTime}] tasks:${tasks.length} sessions:${sessions.length} fired:${fired.length}`);
 }, { timezone: TIMEZONE });
 
 // ════════════════════════════════════════
-// DAILY MORNING SUMMARY — 7:00 AM
+// CRON — الساعة 7 صباحاً: الملخص اليومي
 // ════════════════════════════════════════
-
-const MOTIVATIONAL_QUOTES = [
+const QUOTES = [
   'كل يوم هو فرصة جديدة لتحقيق ما أخفقت فيه أمس',
   'الإعداد الجيد لليوم هو انتصارك المضمون في قاعة المحكمة',
   'المحامي الناجح يبني نجاحه بالاستعداد الدقيق لا بالارتجال',
@@ -314,327 +383,220 @@ const MOTIVATIONAL_QUOTES = [
   'من أتقن يومه أتقن حياته ومن أهمل يومه أهمل مستقبله',
   'العدالة الحقيقية تبدأ من مكتبك قبل أن تصل إلى قاعة المحاكمة',
   'الوقت رأس المال الحقيقي للمحامي — استثمره فيما يُثمر ويُدوم',
-  'كل تحدٍّ قانوني هو فرصة لإثبات كفاءتك وصقل خبرتك',
   'الصبر والمثابرة يحوّلان القضايا الصعبة إلى انتصارات ممكنة',
   'ابدأ يومك بنية صادقة وستجد أن الصعاب تتراجع أمام عزيمتك',
   'الاستعداد المبكر للجلسة هو نصف الانتصار فيها',
+  'كل تحدٍّ قانوني هو فرصة لإثبات كفاءتك وصقل خبرتك',
 ];
-
 const DAYS_AR   = ['الأحد','الاثنين','الثلاثاء','الأربعاء','الخميس','الجمعة','السبت'];
-const MONTHS_AR = ['يناير','فبراير','مارس','أبريل','مايو','يونيو',
-                   'يوليو','أغسطس','سبتمبر','أكتوبر','نوفمبر','ديسمبر'];
-const PRI_ICON  = { high: '🔴', medium: '🟡', low: '🟢' };
+const MONTHS_AR = ['يناير','فبراير','مارس','أبريل','مايو','يونيو','يوليو','أغسطس','سبتمبر','أكتوبر','نوفمبر','ديسمبر'];
 
 function buildDailySummary(now, tasks, sessions, deadlines) {
   const today  = dateStr(now);
   const plus3  = dateStr(new Date(now.getTime() + 3 * 86400000));
-
-  // اختيار رسالة تحفيزية بناءً على رقم اليوم في السنة
-  const dayOfYear = Math.floor((now - new Date(now.getFullYear(), 0, 0)) / 86400000);
-  const quote     = MOTIVATIONAL_QUOTES[dayOfYear % MOTIVATIONAL_QUOTES.length];
-
-  // ── بناء الرسالة ──
+  const doy    = Math.floor((now - new Date(now.getFullYear(), 0, 0)) / 86400000);
+  const quote  = QUOTES[doy % QUOTES.length];
   let msg = '';
-
-  // العنوان والتاريخ
   msg += `🌅 *صباح الخير ⚖️*\n`;
   msg += `📅 *${DAYS_AR[now.getDay()]}، ${now.getDate()} ${MONTHS_AR[now.getMonth()]} ${now.getFullYear()}*\n`;
-  msg += `\n_"${quote}"_\n`;
-  msg += `\n${SEP}\n`;
+  msg += `\n_"${quote}"_\n\n${SEP}\n`;
 
-  // 1. جلسات اليوم
-  const todaySess = sessions
-    .filter(s => s.date === today)
-    .sort((a, b) => (a.time || '').localeCompare(b.time || ''));
-
-  if (todaySess.length) {
-    msg += `\n🏛️ *جلسات اليوم — ${todaySess.length} جلسة:*\n`;
-    todaySess.forEach(s => {
-      msg += `\n▪️ *${s.time || '—'}* — ${s.client || '—'}\n`;
-      if (s.court)   msg += `   🏛️ ${s.court}\n`;
-      if (s.caseNum) msg += `   📋 القضية: ${s.caseNum}\n`;
-      if (s.sessType) msg += `   🏷️ ${s.sessType}\n`;
-      if (s.notes)   msg += `   📝 ${s.notes}\n`;
-    });
-  } else {
-    msg += `\n🏛️ *جلسات اليوم:* لا توجد جلسات\n`;
+  // جلسات اليوم
+  const todaySess = sessions.filter(s => s.date === today).sort((a,b) => (a.time||'').localeCompare(b.time||''));
+  msg += todaySess.length ? `\n🏛️ *جلسات اليوم — ${todaySess.length}:*\n` : `\n🏛️ *جلسات اليوم:* لا توجد\n`;
+  for (const s of todaySess) {
+    msg += `\n▪️ *${s.time||'—'}* — ${s.client||'—'}\n`;
+    if (s.court)    msg += `   🏛️ ${s.court}\n`;
+    if (s.caseNum)  msg += `   📋 ${s.caseNum}\n`;
+    if (s.sessType) msg += `   🏷️ ${s.sessType}\n`;
+    if (s.notes)    msg += `   📝 ${s.notes}\n`;
   }
 
-  // 2. مهام اليوم (يومية + مجدولة لهذا اليوم)
+  // مهام اليوم
   const todayTasks = tasks
-    .filter(t => !t.completed && (
-      t.dueDate === today ||
-      (!t.dueDate && t.category === 'daily')
-    ))
-    .sort((a, b) => {
-      const p = { high: 0, medium: 1, low: 2 };
-      return (p[a.priority] ?? 1) - (p[b.priority] ?? 1);
-    });
-
+    .filter(t => !t.completed && (t.dueDate === today || (!t.dueDate && t.category === 'daily')))
+    .sort((a,b) => ({high:0,medium:1,low:2}[a.priority]||1) - ({high:0,medium:1,low:2}[b.priority]||1));
   msg += `\n${SEP}\n`;
-  if (todayTasks.length) {
-    msg += `\n📋 *مهام اليوم — ${todayTasks.length} مهمة:*\n`;
-    todayTasks.slice(0, 8).forEach(t => {
-      const icon = PRI_ICON[t.priority] || '⚪';
-      msg += `• ${icon} ${t.title}`;
-      if (t.dueTime) msg += ` 🕐 ${t.dueTime}`;
-      if (t.subcategory) msg += ` _(${t.subcategory})_`;
-      msg += '\n';
-    });
-    if (todayTasks.length > 8) msg += `_...و${todayTasks.length - 8} مهام أخرى_\n`;
-  } else {
-    msg += `\n📋 *مهام اليوم:* لا توجد مهام مجدولة\n`;
+  msg += todayTasks.length ? `\n📋 *مهام اليوم — ${todayTasks.length}:*\n` : `\n📋 *مهام اليوم:* لا توجد\n`;
+  for (const t of todayTasks.slice(0, 8)) {
+    msg += `• ${PRI_IC[t.priority]||'⚪'} ${t.title}`;
+    if (t.dueTime)     msg += ` 🕐 ${t.dueTime}`;
+    if (t.subcategory) msg += ` _(${t.subcategory})_`;
+    msg += '\n';
+  }
+  if (todayTasks.length > 8) msg += `_...و${todayTasks.length - 8} مهام أخرى_\n`;
+
+  // مواعيد قانونية خلال 3 أيام
+  const nearDls = deadlines.filter(d => d.deadline >= today && d.deadline <= plus3)
+    .sort((a,b) => a.deadline.localeCompare(b.deadline));
+  msg += `\n${SEP}\n`;
+  msg += nearDls.length ? `\n⚖️ *مواعيد قانونية خلال 3 أيام — ${nearDls.length}:*\n` : `\n⚖️ *مواعيد قانونية:* لا توجد خلال 3 أيام\n`;
+  for (const dl of nearDls) {
+    const [dy,dm,dd] = dl.deadline.split('-').map(Number);
+    const diff = Math.round((new Date(dy,dm-1,dd,9) - now) / 86400000);
+    msg += `\n▪️ *${dl.name}*\n`;
+    msg += `   ${diff <= 0 ? '⚠️ اليوم!' : diff === 1 ? '⏰ غداً' : `📅 بعد ${diff} أيام`} — ${dd}/${dm}/${dy}\n`;
+    if (dl.category) msg += `   🏷️ ${dl.category}\n`;
+    if (dl.notes)    msg += `   📝 ${dl.notes}\n`;
   }
 
-  // 3. المواعيد القانونية المنتهية خلال 3 أيام
-  const nearDls = deadlines
-    .filter(d => d.deadline >= today && d.deadline <= plus3)
-    .sort((a, b) => a.deadline.localeCompare(b.deadline));
-
-  msg += `\n${SEP}\n`;
-  if (nearDls.length) {
-    msg += `\n⚖️ *مواعيد قانونية قادمة خلال 3 أيام — ${nearDls.length}:*\n`;
-    nearDls.forEach(d => {
-      const [dy, dm, dd] = (d.deadline || '').split('-').map(Number);
-      const diffMs = new Date(dy, dm - 1, dd, 9, 0, 0).getTime() - now.getTime();
-      const diff   = Math.round(diffMs / 86400000);
-      const when   = diff <= 0 ? '⚠️ *اليوم!*' : diff === 1 ? '⏰ *غداً*' : `📅 بعد ${diff} أيام`;
-      msg += `\n▪️ *${d.name}*\n`;
-      msg += `   ${when} — ${dd}/${dm}/${dy}\n`;
-      if (d.category) msg += `   🏷️ ${d.category}\n`;
-      if (d.notes)    msg += `   📝 ${d.notes}\n`;
-    });
-  } else {
-    msg += `\n⚖️ *مواعيد قانونية قادمة:* لا توجد خلال 3 أيام\n`;
-  }
-
-  // 4. المهام المتأخرة
-  const overdue = tasks
-    .filter(t => !t.completed && t.dueDate && t.dueDate < today)
-    .sort((a, b) => a.dueDate.localeCompare(b.dueDate));
-
+  // مهام متأخرة
+  const overdue = tasks.filter(t => !t.completed && t.dueDate && t.dueDate < today)
+    .sort((a,b) => a.dueDate.localeCompare(b.dueDate));
   msg += `\n${SEP}\n`;
   if (overdue.length) {
-    msg += `\n⏰ *مهام متأخرة — ${overdue.length} مهمة:*\n`;
-    overdue.slice(0, 6).forEach(t => {
-      const d = Math.abs(Math.round(
-        (new Date(t.dueDate + 'T12:00:00').getTime() - now.getTime()) / 86400000
-      ));
-      const icon = PRI_ICON[t.priority] || '⚪';
-      msg += `• ${icon} ${t.title} _(منذ ${d} يوم)_\n`;
-    });
-    if (overdue.length > 6) msg += `_...و${overdue.length - 6} مهام أخرى متأخرة_\n`;
+    msg += `\n⏰ *مهام متأخرة — ${overdue.length}:*\n`;
+    for (const t of overdue.slice(0, 6)) {
+      const d = Math.abs(Math.round((new Date(t.dueDate+'T12:00:00') - now) / 86400000));
+      msg += `• ${PRI_IC[t.priority]||'⚪'} ${t.title} _(منذ ${d} يوم)_\n`;
+    }
+    if (overdue.length > 6) msg += `_...و${overdue.length - 6} مهام أخرى_\n`;
   } else {
     msg += `\n✅ *لا توجد مهام متأخرة — أحسنت!*\n`;
   }
 
-  // خلاصة إذا لا يوجد شيء
-  const isEmpty = !todaySess.length && !todayTasks.length && !nearDls.length && !overdue.length;
-  if (isEmpty) {
-    msg += `\n\n🎉 *يوم فارغ من المواعيد — استثمره في التطوير والإعداد!*\n`;
+  if (!todaySess.length && !todayTasks.length && !nearDls.length && !overdue.length) {
+    msg += `\n🎉 *يوم فارغ — استثمره في التطوير والإعداد!*\n`;
   }
-
   msg += `\n${SEP}`;
   return msg;
 }
 
 cron.schedule('0 7 * * *', async () => {
-  const now       = nowInTZ();
-  const today     = dateStr(now);
-  const tasks     = readJSON(TASKS_FILE,     []);
-  const sessions  = readJSON(SESSIONS_FILE,  []);
-  const deadlines = readJSON(DEADLINES_FILE, []);
-
-  console.log(`[DAILY] Building morning summary for ${today}`);
-
+  const now  = nowInTZ();
+  const { tasks, sessions, deadlines, source } = await getAppData();
+  console.log(`[DAILY] source:${source} tasks:${tasks.length} sessions:${sessions.length}`);
   const text = buildDailySummary(now, tasks, sessions, deadlines);
   const ok   = await sendTelegram(text);
-
-  appendLog({ event: 'daily_summary', ok, date: today,
-    stats: {
-      sessions:  sessions.filter(s => s.date === today).length,
-      tasks:     tasks.filter(t => !t.completed && (t.dueDate === today || (!t.dueDate && t.category === 'daily'))).length,
-      overdue:   tasks.filter(t => !t.completed && t.dueDate && t.dueDate < today).length,
-      deadlines: deadlines.filter(d => d.deadline >= today && d.deadline <= dateStr(new Date(now.getTime() + 3*86400000))).length,
-    }
-  });
-  console.log(`[DAILY] Summary sent: ${ok}`);
+  appendLog({ event:'daily_summary', ok, date:dateStr(now) });
+  console.log(`[DAILY] sent:${ok}`);
 }, { timezone: TIMEZONE });
 
 // ════════════════════════════════════════
-// EXPRESS APP
+// EXPRESS
 // ════════════════════════════════════════
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
-// Request logger
-app.use((req, _res, next) => {
-  console.log(`[HTTP] ${req.method} ${req.path}`);
-  next();
-});
-
-// ── Health & status ─────────────────────
-app.get('/', (req, res) => {
+// ── Status ──────────────────────────────
+app.get('/', async (_req, res) => {
+  const { tasks, sessions, deadlines, source } = await getAppData();
   res.json({
-    status:    'ok',
-    time:      new Date().toISOString(),
-    timezone:  TIMEZONE,
-    telegram:  !!TG_TOKEN,
-    tasks:     readJSON(TASKS_FILE,    []).length,
-    sessions:  readJSON(SESSIONS_FILE, []).length,
-    notified:  Object.keys(readJSON(NOTIFIED_FILE, {})).length
+    status:     'ok',
+    time:       new Date().toISOString(),
+    timezone:   TIMEZONE,
+    telegram:   !!TG_TOKEN,
+    firebase:   !!firestoreDB,
+    dataSource: source,
+    counts:     { tasks: tasks.length, sessions: sessions.length, deadlines: deadlines.length },
+    notified:   Object.keys(readJSON(NOTIFIED_FILE, {})).length,
   });
 });
 
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
-// ── Tasks ───────────────────────────────
-app.get('/tasks', (_req, res) => {
-  res.json(readJSON(TASKS_FILE, []));
+// ── Firebase Status ──────────────────────
+app.get('/firebase-status', async (_req, res) => {
+  if (!firestoreDB) {
+    return res.status(503).json({
+      connected: false,
+      firebase:  false,
+      message:   'FIREBASE_SERVICE_ACCOUNT not set or invalid. Check Railway Variables.',
+    });
+  }
+  try {
+    const { tasks, sessions, deadlines, source } = await getAppData();
+    res.json({
+      connected: true,
+      firebase:  true,
+      project:   FIREBASE_PROJECT,
+      source,
+      counts:    { tasks: tasks.length, sessions: sessions.length, deadlines: deadlines.length },
+      message:   'Firestore connection OK',
+    });
+  } catch (e) {
+    res.status(500).json({ connected: false, error: e.message });
+  }
 });
 
+// ── Data sync endpoints (from app) ───────
 app.post('/tasks', (req, res) => {
-  const { tasks, subcats } = req.body;
-  if (!Array.isArray(tasks))
-    return res.status(400).json({ error: 'tasks must be an array' });
-
-  writeJSON(TASKS_FILE, tasks);
-  if (subcats) writeJSON(SUBCATS_FILE, subcats);
-
-  appendLog({ event: 'tasks_saved', count: tasks.length });
-  console.log(`[TASKS] Saved ${tasks.length} tasks`);
+  const { tasks } = req.body;
+  if (!Array.isArray(tasks)) return res.status(400).json({ error: 'tasks must be array' });
+  console.log(`[TASKS] received ${tasks.length} tasks (local cache)`);
   res.json({ ok: true, count: tasks.length });
 });
 
-app.delete('/tasks/:id', (req, res) => {
-  const tasks = readJSON(TASKS_FILE, []).filter(t => t.id !== req.params.id);
-  writeJSON(TASKS_FILE, tasks);
-  res.json({ ok: true });
-});
-
-// ── Sessions ────────────────────────────
-app.get('/sessions', (_req, res) => {
-  res.json(readJSON(SESSIONS_FILE, []));
-});
-
 app.post('/sessions', (req, res) => {
-  let sessions = req.body;
-  if (!Array.isArray(sessions)) sessions = [sessions];
-  writeJSON(SESSIONS_FILE, sessions);
-  appendLog({ event: 'sessions_saved', count: sessions.length });
-  console.log(`[SESSIONS] Saved ${sessions.length} sessions`);
-  res.json({ ok: true, count: sessions.length });
+  let s = req.body;
+  if (!Array.isArray(s)) s = [s];
+  console.log(`[SESSIONS] received ${s.length}`);
+  res.json({ ok: true, count: s.length });
 });
-
-// ── Deadlines ──────────────────────────────
-app.get('/deadlines', (_req, res) => res.json(readJSON(DEADLINES_FILE, [])));
 
 app.post('/deadlines', (req, res) => {
-  let dls = req.body;
-  if (!Array.isArray(dls)) dls = [dls];
-  writeJSON(DEADLINES_FILE, dls);
-  console.log(`[DEADLINES] Saved ${dls.length}`);
-  res.json({ ok: true, count: dls.length });
+  let d = req.body;
+  if (!Array.isArray(d)) d = [d];
+  console.log(`[DEADLINES] received ${d.length}`);
+  res.json({ ok: true, count: d.length });
 });
 
-// Add or update a single session
-app.put('/sessions/:id', (req, res) => {
-  const sessions = readJSON(SESSIONS_FILE, []);
-  const idx      = sessions.findIndex(s => s.id === req.params.id);
-  const session  = { ...req.body, id: req.params.id };
-  if (idx >= 0) sessions[idx] = session;
-  else sessions.push(session);
-  writeJSON(SESSIONS_FILE, sessions);
-  res.json({ ok: true, session });
-});
-
-app.delete('/sessions/:id', (req, res) => {
-  const sessions = readJSON(SESSIONS_FILE, []).filter(s => s.id !== req.params.id);
-  writeJSON(SESSIONS_FILE, sessions);
-  // Clear its notifications so it can fire again if re-added
-  const notified = readJSON(NOTIFIED_FILE, {});
-  Object.keys(notified).filter(k => k.startsWith(`s-${req.params.id}-`)).forEach(k => delete notified[k]);
-  writeJSON(NOTIFIED_FILE, notified);
-  res.json({ ok: true });
-});
-
-// ── Test & manual send ───────────────────
-// Manual daily summary trigger
-// إرسال الملخص الصباحي يدوياً للاختبار
-app.post('/daily-summary', async (_req, res) => {
-  const now       = nowInTZ();
-  const tasks     = readJSON(TASKS_FILE,     []);
-  const sessions  = readJSON(SESSIONS_FILE,  []);
-  const deadlines = readJSON(DEADLINES_FILE, []);
-  const text      = buildDailySummary(now, tasks, sessions, deadlines);
-  const ok        = await sendTelegram(text);
-  appendLog({ event: 'daily_summary_manual', ok, date: dateStr(now) });
-  res.json({ ok, preview: text.slice(0, 200) + '...' });
-});
-
+// ── Test & manual ────────────────────────
 app.post('/test', async (_req, res) => {
   const ok = await sendTelegram(
-    '🔔 *اختبار الإشعارات*\n\n✅ سيرفر التذكيرات يعمل بشكل صحيح\n⏰ ' + new Date().toLocaleString('ar-SA', { timeZone: TIMEZONE })
+    `🔔 *اختبار الإشعارات*\n\n✅ سيرفر التذكيرات يعمل\n🔥 Firebase: ${firestoreDB ? 'متصل' : 'غير متصل'}\n⏰ ${new Date().toLocaleString('ar-SA', { timeZone: TIMEZONE })}`
   );
   res.json({ ok });
 });
 
+app.post('/daily-summary', async (_req, res) => {
+  const now                                    = nowInTZ();
+  const { tasks, sessions, deadlines, source } = await getAppData();
+  console.log(`[DAILY-MANUAL] source:${source}`);
+  const text = buildDailySummary(now, tasks, sessions, deadlines);
+  const ok   = await sendTelegram(text);
+  appendLog({ event:'daily_summary_manual', ok, date:dateStr(now) });
+  res.json({ ok, preview: text.slice(0, 300) });
+});
+
 app.post('/notify', async (req, res) => {
-  const { text, silent } = req.body;
-  if (!text) return res.status(400).json({ error: 'text is required' });
-  const ok = await sendTelegram(text, !!silent);
+  const { text } = req.body;
+  if (!text) return res.status(400).json({ error: 'text required' });
+  const ok = await sendTelegram(text);
   res.json({ ok });
 });
 
-// ── Logs ─────────────────────────────────
-app.get('/logs', (_req, res) => {
-  res.json(readJSON(LOG_FILE, []));
-});
+// ── Logs & cache ─────────────────────────
+app.get('/logs', (_req, res) => res.json(readJSON(LOG_FILE, [])));
 
-app.delete('/logs', (_req, res) => {
-  writeJSON(LOG_FILE, []);
-  res.json({ ok: true });
-});
-
-// ── Reset notified (force resend) ────────
 app.delete('/notified', (_req, res) => {
   writeJSON(NOTIFIED_FILE, {});
   res.json({ ok: true, message: 'Notification cache cleared' });
 });
 
-app.delete('/notified/:key', (req, res) => {
-  const notified = readJSON(NOTIFIED_FILE, {});
-  delete notified[decodeURIComponent(req.params.key)];
-  writeJSON(NOTIFIED_FILE, notified);
-  res.json({ ok: true });
-});
-
 // ════════════════════════════════════════
 // START
 // ════════════════════════════════════════
+initFirebaseAdmin();
+
 app.listen(PORT, () => {
   console.log(`
 ╔══════════════════════════════════════╗
-║       Reminder Server  v1.0          ║
+║   Reminder Server  v3 — Firestore    ║
 ╚══════════════════════════════════════╝
-  🚀  Port     : ${PORT}
-  🌍  Timezone : ${TIMEZONE}
-  🤖  Telegram : ${TG_TOKEN ? '✅ Configured' : '❌ NOT configured (set TG_TOKEN)'}
-  📋  Tasks    : ${readJSON(TASKS_FILE,    []).length}
-  🗓️   Sessions : ${readJSON(SESSIONS_FILE, []).length}
+  🚀  Port      : ${PORT}
+  🌍  Timezone  : ${TIMEZONE}
+  🤖  Telegram  : ${TG_TOKEN ? '✅ configured' : '❌ set TG_TOKEN'}
+  🔥  Firebase  : ${process.env.FIREBASE_SERVICE_ACCOUNT ? '✅ service account set' : '⚠️  set FIREBASE_SERVICE_ACCOUNT'}
+  📦  Project   : ${FIREBASE_PROJECT}
 
   Endpoints:
-  GET  /            → status
-  GET  /health      → health check
-  POST /tasks       → sync tasks from app
-  GET  /tasks       → list tasks
-  POST /sessions    → sync sessions
-  PUT  /sessions/:id → add/update session
-  DEL  /sessions/:id → delete session
-  POST /test        → send test Telegram message
-  POST /notify      → send custom message
-  GET  /logs        → notification history
-  DEL  /notified    → reset notification cache
+  GET  /                 → status + data counts
+  GET  /firebase-status  → Firestore connection test
+  POST /daily-summary    → send morning summary now
+  POST /test             → send test Telegram message
+  GET  /logs             → notification history
+  DEL  /notified         → reset notification cache
 `);
 });

@@ -19,6 +19,10 @@ if not exist node_modules (
     echo  تثبيت الحزم...
     call npm install
     echo.
+) else if not exist node_modules\firebase-admin (
+    echo  تثبيت firebase-admin...
+    call npm install firebase-admin
+    echo.
 )
 
 echo  السيرفر يعمل على: http://localhost:3001
